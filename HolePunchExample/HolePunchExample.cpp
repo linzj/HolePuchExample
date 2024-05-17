@@ -20,15 +20,17 @@ using Microsoft::WRL::ComPtr;
 #define MAX_LOADSTRING 100
 #define ASSERT_HRESULT_SUCCEEDED(expr)                                   \
   {                                                                      \
-    HRESULT hr = expr;                                                   \
+    hr = expr;                                                           \
     if (FAILED(hr)) {                                                    \
       OutputDebugStringFmt(#expr " failed %lx.", static_cast<long>(hr)); \
+      throw std::exception();                                            \
     }                                                                    \
   }
 
 #define ASSERT_NE(a, b)                                       \
   if ((a) == (b)) {                                           \
     OutputDebugStringFmt(#a " should not equals to " #b "!"); \
+    throw std::exception();                                   \
   }
 
 namespace {
@@ -81,6 +83,7 @@ void SetWindowHole(HWND hwnd, int holeX, int holeY, int holeWidth,
 ComPtr<IDCompositionVisual2> NewBackgroundVisual(
     IDCompositionDevice3* dcomp_device, ID3D11Device* d3d11_device, int width,
     int height, const float background_fill_color[4]) {
+  HRESULT hr;
   ComPtr<IDCompositionSurface> background_fill;
   ASSERT_HRESULT_SUCCEEDED(dcomp_device->CreateSurface(
       width, height, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED,
@@ -400,7 +403,7 @@ void MainWindow::InitializePaintContext() {
     // on the color of the redirection surface when testing alpha blending. We
     // default to magenta to make it obvious when something shouldn't be
     // visible.
-    const float background_fill_color[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+    const float background_fill_color[4] = {1.0f, 1.0f, 0.0f, 1.0f};
     RECT winRect;
     GetClientRect(hwnd_, &winRect);
     int width = winRect.right - winRect.left;
@@ -507,45 +510,61 @@ void ChildWindow::InitializePaintContext() {
   d3d11_device_ = main_window->d3d11_device();
   context_ = main_window->context();
   swap_chain_.Reset();
-  DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {0};
-  swapChainDesc.BufferCount = 2;
-  swapChainDesc.Width = 0;
-  swapChainDesc.Height = 0;
-  swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-  swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-  swapChainDesc.SampleDesc.Count = 1;
-  hr = main_window->factory()->CreateSwapChainForHwnd(
-      d3d11_device_.Get(), hwnd_, &swapChainDesc, nullptr, nullptr,
-      swap_chain_.GetAddressOf());
-  if (FAILED(hr)) {
-    OutputDebugStringFmt("CreateSwapChainForHwnd failed: hr: %lx", (long)hr);
-    _exit(1);
-  }
+  RECT winRect;
+  GetClientRect(hwnd_parent_, &winRect);
+  int width = winRect.right - winRect.left;
+  int height = winRect.bottom - winRect.top;
+  bool use_swapchain = true;
   // Init dcomp
   ComPtr<IDCompositionDevice3> dcomp_device = main_window->dcomp_device();
   ComPtr<IDCompositionVisual2> visual;
 
-  // New surface from window.
-  ComPtr<IUnknown> surface;
-  ComPtr<IDCompositionDesktopDevice> desktop_device;
-  ASSERT_HRESULT_SUCCEEDED(dcomp_device.As(&desktop_device));
-  ASSERT_HRESULT_SUCCEEDED(
-      desktop_device->CreateSurfaceFromHwnd(hwnd_, &surface));
   ASSERT_HRESULT_SUCCEEDED(dcomp_device->CreateVisual(&visual));
 
-  hr = visual->SetContent(surface.Get());
-  if (FAILED(hr)) {
-    OutputDebugStringFmt("SetContent failed: hr: %lx", (long)hr);
-    _exit(1);
+  if (!use_swapchain) {
+    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {0};
+    swapChainDesc.BufferCount = 2;
+    swapChainDesc.Width = 0;
+    swapChainDesc.Height = 0;
+    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    swapChainDesc.SampleDesc.Count = 1;
+    swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    ASSERT_HRESULT_SUCCEEDED(main_window->factory()->CreateSwapChainForHwnd(
+        d3d11_device_.Get(), hwnd_, &swapChainDesc, nullptr, nullptr,
+        &swap_chain_));
+    // New surface from window.
+    ComPtr<IUnknown> surface;
+    ComPtr<IDCompositionDesktopDevice> desktop_device;
+    ASSERT_HRESULT_SUCCEEDED(dcomp_device.As(&desktop_device));
+    ASSERT_HRESULT_SUCCEEDED(
+        desktop_device->CreateSurfaceFromHwnd(hwnd_, &surface));
+    ASSERT_HRESULT_SUCCEEDED(visual->SetContent(surface.Get()));
+  } else {
+    DXGI_SWAP_CHAIN_DESC1 scd;
+    ZeroMemory(&scd, sizeof(scd));
+    scd.SampleDesc.Count = 1;
+    scd.SampleDesc.Quality = 0;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    scd.Scaling = DXGI_SCALING_STRETCH;
+    scd.Width = width;
+    scd.Height = height;
+    scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.Stereo = FALSE;
+    scd.BufferUsage = DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.Flags = 0;
+    scd.BufferCount = 4;
+    scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+    ASSERT_HRESULT_SUCCEEDED(
+        main_window->factory()->CreateSwapChainForComposition(
+            d3d11_device_.Get(), &scd, NULL, &swap_chain_));
+    ASSERT_HRESULT_SUCCEEDED(visual->SetContent(swap_chain_.Get()));
   }
 
   // Setup the clip
   if (0) {
-    RECT winRect;
-    GetClientRect(hwnd_parent_, &winRect);
-    int width = winRect.right - winRect.left;
-    int height = winRect.bottom - winRect.top;
     float background_fill_color[4] = {r_, g_, b_, a_};
     ComPtr<IDCompositionVisual2> background_visual;
     background_visual =
