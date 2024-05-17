@@ -45,10 +45,9 @@ WCHAR szWindowClass[MAX_LOADSTRING];  // 主窗口类名
 ATOM MyRegisterClass(HINSTANCE hInstance);
 ATOM MyRegisterChildClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
-HWND InitInstanceChild(HINSTANCE hInstance, HWND parent,
+void InitInstanceChild(HINSTANCE hInstance, HWND parent,
                        std::shared_ptr<ChildWindow>* child_window, bool ontop);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-LRESULT CALLBACK WndProcChild(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 
 void OutputDebugStringFmt(const char* format, ...) {
@@ -178,14 +177,12 @@ class ChildWindow : public WindowBase {
   ~ChildWindow();
 
   void set_on_top(bool ontop) { ontop_ = ontop; }
-  void OnCreate(HWND hwnd);
   void OnParentSize(size_t x, size_t y, size_t width, size_t height);
   void OnPaint();
   void SetClearColor(float r, float g, float b, float a);
 
  private:
   void InitializePaintContext();
-  HWND hwnd_ = nullptr;
   HWND hwnd_parent_;
   ComPtr<ID3D11Device> d3d11_device_;
   ComPtr<ID3D11DeviceContext> context_;
@@ -432,13 +429,9 @@ ChildWindow::ChildWindow(HWND parent) : hwnd_parent_(parent) {}
 
 ChildWindow::~ChildWindow() {}
 
-void ChildWindow::OnCreate(HWND hwnd) { hwnd_ = hwnd; }
-
 void ChildWindow::OnParentSize(size_t x, size_t y, size_t width,
                                size_t height) {
   HWND insert_order = ontop_ ? HWND_TOP : HWND_BOTTOM;
-  SetWindowPos(hwnd_, insert_order, static_cast<INT>(x), static_cast<INT>(y),
-               static_cast<INT>(width), static_cast<INT>(height), 0);
   InitializePaintContext();
   // Must paint to get the content.
   OnPaint();
@@ -447,7 +440,7 @@ void ChildWindow::OnParentSize(size_t x, size_t y, size_t width,
 
 void ChildWindow::OnPaint() {
   RECT winRect;
-  GetClientRect(hwnd_, &winRect);
+  GetClientRect(hwnd_parent_, &winRect);
   D3D11_VIEWPORT viewport = {0.0f,
                              0.0f,
                              (FLOAT)(winRect.right - winRect.left),
@@ -514,54 +507,31 @@ void ChildWindow::InitializePaintContext() {
   GetClientRect(hwnd_parent_, &winRect);
   int width = winRect.right - winRect.left;
   int height = winRect.bottom - winRect.top;
-  bool use_swapchain = true;
   // Init dcomp
   ComPtr<IDCompositionDevice3> dcomp_device = main_window->dcomp_device();
   ComPtr<IDCompositionVisual2> visual;
 
   ASSERT_HRESULT_SUCCEEDED(dcomp_device->CreateVisual(&visual));
 
-  if (!use_swapchain) {
-    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {0};
-    swapChainDesc.BufferCount = 2;
-    swapChainDesc.Width = 0;
-    swapChainDesc.Height = 0;
-    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    swapChainDesc.SampleDesc.Count = 1;
-    swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-    ASSERT_HRESULT_SUCCEEDED(main_window->factory()->CreateSwapChainForHwnd(
-        d3d11_device_.Get(), hwnd_, &swapChainDesc, nullptr, nullptr,
-        &swap_chain_));
-    // New surface from window.
-    ComPtr<IUnknown> surface;
-    ComPtr<IDCompositionDesktopDevice> desktop_device;
-    ASSERT_HRESULT_SUCCEEDED(dcomp_device.As(&desktop_device));
-    ASSERT_HRESULT_SUCCEEDED(
-        desktop_device->CreateSurfaceFromHwnd(hwnd_, &surface));
-    ASSERT_HRESULT_SUCCEEDED(visual->SetContent(surface.Get()));
-  } else {
-    DXGI_SWAP_CHAIN_DESC1 scd;
-    ZeroMemory(&scd, sizeof(scd));
-    scd.SampleDesc.Count = 1;
-    scd.SampleDesc.Quality = 0;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    scd.Scaling = DXGI_SCALING_STRETCH;
-    scd.Width = width;
-    scd.Height = height;
-    scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.Stereo = FALSE;
-    scd.BufferUsage = DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.Flags = 0;
-    scd.BufferCount = 4;
-    scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+  DXGI_SWAP_CHAIN_DESC1 scd;
+  ZeroMemory(&scd, sizeof(scd));
+  scd.SampleDesc.Count = 1;
+  scd.SampleDesc.Quality = 0;
+  scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+  scd.Scaling = DXGI_SCALING_STRETCH;
+  scd.Width = width;
+  scd.Height = height;
+  scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  scd.Stereo = FALSE;
+  scd.BufferUsage = DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_RENDER_TARGET_OUTPUT;
+  scd.Flags = 0;
+  scd.BufferCount = 4;
+  scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
 
-    ASSERT_HRESULT_SUCCEEDED(
-        main_window->factory()->CreateSwapChainForComposition(
-            d3d11_device_.Get(), &scd, NULL, &swap_chain_));
-    ASSERT_HRESULT_SUCCEEDED(visual->SetContent(swap_chain_.Get()));
-  }
+  ASSERT_HRESULT_SUCCEEDED(
+      main_window->factory()->CreateSwapChainForComposition(
+          d3d11_device_.Get(), &scd, NULL, &swap_chain_));
+  ASSERT_HRESULT_SUCCEEDED(visual->SetContent(swap_chain_.Get()));
 
   // Setup the clip
   if (0) {
@@ -606,31 +576,6 @@ ATOM MyRegisterClass(HINSTANCE hInstance) {
   wcex.lpszMenuName = nullptr;
   wcex.lpszClassName = szWindowClass;
   wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
-
-  return RegisterClassExW(&wcex);
-}
-
-//
-//  函数: MyRegisterClass()
-//
-//  目标: 注册窗口类。
-//
-ATOM MyRegisterChildClass(HINSTANCE hInstance) {
-  WNDCLASSEXW wcex;
-
-  wcex.cbSize = sizeof(WNDCLASSEX);
-
-  wcex.style = 0;
-  wcex.lpfnWndProc = WndProcChild;
-  wcex.cbClsExtra = 0;
-  wcex.cbWndExtra = 0;
-  wcex.hInstance = hInstance;
-  wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_HOLEPUNCHEXAMPLE));
-  wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-  wcex.hbrBackground = (HBRUSH)(nullptr);
-  wcex.lpszMenuName = nullptr;
-  wcex.lpszClassName = L"childwindow";
-  wcex.hIconSm = nullptr;
 
   return RegisterClassExW(&wcex);
 }
@@ -702,32 +647,9 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
   return TRUE;
 }
 
-HWND InitInstanceChild(HINSTANCE hInstance, HWND parent,
+void InitInstanceChild(HINSTANCE hInstance, HWND parent,
                        std::shared_ptr<ChildWindow>* child_window, bool ontop) {
-  hInst = hInstance;  // 将实例句柄存储在全局变量中
-
-  DWORD ex_style = WS_EX_NOPARENTNOTIFY | WS_EX_LAYERED | WS_EX_TRANSPARENT |
-                   WS_EX_NOREDIRECTIONBITMAP;
-  HWND hWnd = CreateWindowExW(ex_style, L"childwindow", L"",
-                              WS_CHILDWINDOW | WS_DISABLED | WS_VISIBLE, 0, 100,
-                              0, 100, parent, nullptr, hInstance, nullptr);
-
-  if (!hWnd) {
-    DWORD error_code = GetLastError();
-    wchar_t error_message[256];
-    swprintf_s(error_message, L"Failed to create child window: Error %lu",
-               error_code);
-    MessageBox(NULL, error_message, L"Error", MB_ICONEXCLAMATION | MB_OK);
-    _exit(1);
-  }
-
-  // SetLayeredWindowAttributes(hWnd, 0 /* color key */, 0 /* alpha */,
-  // LWA_ALPHA);
-
   (*child_window)->set_on_top(ontop);
-  (*child_window)->OnCreate(hWnd);
-  SetWindowLongPtr(hWnd, GWLP_USERDATA,
-                   reinterpret_cast<LONG_PTR>(child_window));
 
   // Resize the child now.
   RECT winRect;
@@ -735,43 +657,6 @@ HWND InitInstanceChild(HINSTANCE hInstance, HWND parent,
   (*child_window)
       ->OnParentSize(0, 0, winRect.right - winRect.left,
                      winRect.bottom - winRect.top);
-
-  if (ontop && false) {
-    int width = winRect.right - winRect.left;
-    int height = winRect.bottom - winRect.top;
-    SetWindowHole(hWnd, width / 4, height / 4, width / 2, height / 2, width,
-                  height);
-  }
-  return hWnd;
-}
-
-BOOL SetPicture(HWND hWnd, HBITMAP hBmp, COLORREF nColor) {
-  BITMAP bm;
-  GetObject(hBmp, sizeof(bm), &bm);
-  SIZE szBmp = {bm.bmWidth, bm.bmHeight};
-
-  HDC hDCScreen = GetDC(NULL);
-  HDC hDCMem = CreateCompatibleDC(hDCScreen);
-  HBITMAP hBmpOld = (HBITMAP)SelectObject(hDCMem, hBmp);
-
-  BLENDFUNCTION blend = {0};
-  blend.BlendOp = AC_SRC_OVER;
-  blend.SourceConstantAlpha = 255;
-  // blend.AlphaFormat = AC_SRC_OVER;
-  blend.AlphaFormat = AC_SRC_ALPHA;
-
-  RECT rc;
-  GetWindowRect(hWnd, &rc);
-
-  POINT ptSrc = {0};
-  POINT ptDest = {rc.left, rc.top};
-  BOOL bRet = UpdateLayeredWindow(hWnd, hDCScreen, &ptDest, &szBmp, hDCMem,
-                                  &ptSrc, nColor, &blend, ULW_ALPHA);
-
-  SelectObject(hDCMem, hBmpOld);
-  DeleteDC(hDCMem);
-  ReleaseDC(NULL, hDCScreen);
-  return bRet;
 }
 
 //
@@ -850,44 +735,6 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
   return (INT_PTR)FALSE;
 }
 
-LRESULT CALLBACK WndProcChild(HWND hWnd, UINT message, WPARAM wParam,
-                              LPARAM lParam) {
-  switch (message) {
-    case WM_ERASEBKGND: {
-      return 1;
-    }
-    case WM_COMMAND: {
-      int wmId = LOWORD(wParam);
-      // 分析菜单选择:
-      switch (wmId) {
-        case IDM_ABOUT:
-          DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
-          break;
-        case IDM_EXIT:
-          DestroyWindow(hWnd);
-          break;
-        default:
-          return DefWindowProc(hWnd, message, wParam, lParam);
-      }
-    } break;
-    case WM_PAINT: {
-      PAINTSTRUCT ps;
-      HDC hdc = BeginPaint(hWnd, &ps);
-      (*WindowBase::FromHWND<std::shared_ptr<ChildWindow>>(hWnd))->OnPaint();
-      EndPaint(hWnd, &ps);
-    } break;
-    case WM_DESTROY:
-      delete WindowBase::FromHWND<std::shared_ptr<ChildWindow>>(hWnd);
-      SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)0);
-      break;
-    case WM_CREATE:
-      break;
-    default:
-      return DefWindowProc(hWnd, message, wParam, lParam);
-  }
-  return 0;
-}
-
 }  // namespace
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -906,7 +753,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
   LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
   LoadStringW(hInstance, IDC_HOLEPUNCHEXAMPLE, szWindowClass, MAX_LOADSTRING);
   MyRegisterClass(hInstance);
-  MyRegisterChildClass(hInstance);
 
   // 执行应用程序初始化:
   if (!InitInstance(hInstance, nCmdShow)) {
