@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <dcomp.h>
 #include <dxgi1_3.h>
 #include <wrl/client.h>  // For ComPtr
 
@@ -17,6 +18,18 @@
 using Microsoft::WRL::ComPtr;
 
 #define MAX_LOADSTRING 100
+#define ASSERT_HRESULT_SUCCEEDED(expr)                                   \
+  {                                                                      \
+    HRESULT hr = expr;                                                   \
+    if (FAILED(hr)) {                                                    \
+      OutputDebugStringFmt(#expr " failed %lx.", static_cast<long>(hr)); \
+    }                                                                    \
+  }
+
+#define ASSERT_NE(a, b)                                       \
+  if ((a) == (b)) {                                           \
+    OutputDebugStringFmt(#a " should not equals to " #b "!"); \
+  }
 
 namespace {
 class ChildWindow;
@@ -65,6 +78,40 @@ void SetWindowHole(HWND hwnd, int holeX, int holeY, int holeWidth,
   DeleteObject(hrgnHole);
 }
 
+ComPtr<IDCompositionVisual2> NewBackgroundVisual(
+    IDCompositionDevice3* dcomp_device, ID3D11Device* d3d11_device, int width,
+    int height, const float background_fill_color[4]) {
+  ComPtr<IDCompositionSurface> background_fill;
+  ASSERT_HRESULT_SUCCEEDED(dcomp_device->CreateSurface(
+      width, height, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED,
+      &background_fill));
+
+  RECT update_rect = {0, 0, width, height};
+  ComPtr<ID3D11Texture2D> update_texture;
+  POINT update_offset;
+  ASSERT_HRESULT_SUCCEEDED(background_fill->BeginDraw(
+      &update_rect, IID_PPV_ARGS(&update_texture), &update_offset));
+  {
+    ComPtr<ID3D11RenderTargetView> render_target;
+    ASSERT_HRESULT_SUCCEEDED(d3d11_device->CreateRenderTargetView(
+        update_texture.Get(), nullptr, &render_target));
+    ASSERT_NE(render_target, nullptr);
+    ComPtr<ID3D11DeviceContext> d3d11_device_context;
+    d3d11_device->GetImmediateContext(&d3d11_device_context);
+    ASSERT_NE(d3d11_device_context, nullptr);
+    d3d11_device_context->ClearRenderTargetView(render_target.Get(),
+                                                background_fill_color);
+  }
+  ASSERT_HRESULT_SUCCEEDED(background_fill->EndDraw());
+
+  ComPtr<IDCompositionVisual2> result;
+  ASSERT_HRESULT_SUCCEEDED(dcomp_device->CreateVisual(&result));
+  // The content of a visual is always drawn behind its children, so we'll
+  // use it for the background fill.
+  ASSERT_HRESULT_SUCCEEDED(result->SetContent(background_fill.Get()));
+  return result;
+}
+
 class WindowBase {
  public:
   template <class T>
@@ -79,13 +126,18 @@ class MainWindow : public WindowBase {
   ~MainWindow();
   void OnCreate(HWND hwnd);
   void OnSize(size_t x, size_t y, size_t width, size_t height);
+  void OnPaint();
   void AddChild(std::shared_ptr<ChildWindow>& child);
-  ID3D11Device* device() { return device_.Get(); }
+  void AddVisualOnTop(IDCompositionVisual2*);
+  ID3D11Device* d3d11_device() { return d3d11_device_.Get(); }
   ID3D11DeviceContext* context() { return context_.Get(); }
   IDXGIFactory2* factory() { return factory_.Get(); }
   ID3D11VertexShader* vertex_shader() { return vertex_shader_.Get(); }
   ID3D11PixelShader* pixel_shader() { return pixel_shader_.Get(); }
   ID3D11InputLayout* input_layout() { return input_layout_.Get(); }
+  IDCompositionDevice3* dcomp_device() { return dcomp_device_.Get(); }
+  IDCompositionVisual2* root_visual() { return root_visual_.Get(); }
+
   ID3D11Buffer** vertex_buffer_address() {
     return vertex_buffer_.GetAddressOf();
   }
@@ -99,13 +151,17 @@ class MainWindow : public WindowBase {
 
   std::vector<std::weak_ptr<ChildWindow>> children_;
   // Define variables to hold the Device and Device Context interfaces
-  ComPtr<ID3D11Device> device_;
+  ComPtr<ID3D11Device> d3d11_device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<IDXGIFactory2> factory_;
   ComPtr<ID3D11VertexShader> vertex_shader_;
   ComPtr<ID3D11PixelShader> pixel_shader_;
   ComPtr<ID3D11InputLayout> input_layout_;
   ComPtr<ID3D11Buffer> vertex_buffer_;
+  ComPtr<IDCompositionDevice3> dcomp_device_;
+  ComPtr<IDCompositionTarget> dcomp_target_;
+  ComPtr<IDCompositionVisual2> root_visual_;
+  ComPtr<IDCompositionVisual2> current_visual_;
 
   UINT num_verts_;
   UINT stride_;
@@ -128,7 +184,7 @@ class ChildWindow : public WindowBase {
   void InitializePaintContext();
   HWND hwnd_ = nullptr;
   HWND hwnd_parent_;
-  ComPtr<ID3D11Device> device_;
+  ComPtr<ID3D11Device> d3d11_device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<IDXGISwapChain1> swap_chain_;
 
@@ -160,11 +216,14 @@ void MainWindow::OnCreate(HWND hWnd) {
 }
 
 void MainWindow::OnSize(size_t x, size_t y, size_t width, size_t height) {
+  if (width == 0 || height == 0) return;
   for (auto& weak_child : children_) {
     auto child = weak_child.lock();
     if (child) child->OnParentSize(x, y, width, height);
   }
 }
+
+void MainWindow::OnPaint() { dcomp_device_->Commit(); }
 
 void MainWindow::InitializePaintContext() {
 #ifdef _DEBUG
@@ -180,7 +239,7 @@ void MainWindow::InitializePaintContext() {
   }
   hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                          createDeviceFlags, nullptr, 0, D3D11_SDK_VERSION,
-                         device_.GetAddressOf(), nullptr,
+                         d3d11_device_.GetAddressOf(), nullptr,
                          context_.GetAddressOf());
   if (FAILED(hr)) {
     OutputDebugStringFmt("D3D11CreateDevice failed: hr: %lx", (long)hr);
@@ -188,8 +247,8 @@ void MainWindow::InitializePaintContext() {
   }
   // Set up debug layer to break on D3D11 errors
   ComPtr<ID3D11Debug> d3dDebug;
-  device_->QueryInterface(__uuidof(ID3D11Debug),
-                          reinterpret_cast<void**>(d3dDebug.GetAddressOf()));
+  d3d11_device_->QueryInterface(
+      __uuidof(ID3D11Debug), reinterpret_cast<void**>(d3dDebug.GetAddressOf()));
   if (d3dDebug) {
     ComPtr<ID3D11InfoQueue> d3dInfoQueue;
     if (SUCCEEDED(d3dDebug->QueryInterface(
@@ -218,9 +277,9 @@ void MainWindow::InitializePaintContext() {
       _exit(1);
     }
 
-    hResult = device_->CreateVertexShader(vsBlob->GetBufferPointer(),
-                                          vsBlob->GetBufferSize(), nullptr,
-                                          vertex_shader_.GetAddressOf());
+    hResult = d3d11_device_->CreateVertexShader(
+        vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr,
+        vertex_shader_.GetAddressOf());
     assert(SUCCEEDED(hResult));
   }
 
@@ -243,9 +302,9 @@ void MainWindow::InitializePaintContext() {
       _exit(1);
     }
 
-    hResult = device_->CreatePixelShader(psBlob->GetBufferPointer(),
-                                         psBlob->GetBufferSize(), nullptr,
-                                         pixel_shader_.GetAddressOf());
+    hResult = d3d11_device_->CreatePixelShader(psBlob->GetBufferPointer(),
+                                               psBlob->GetBufferSize(), nullptr,
+                                               pixel_shader_.GetAddressOf());
     assert(SUCCEEDED(hResult));
   }
 
@@ -257,7 +316,7 @@ void MainWindow::InitializePaintContext() {
         {"TEX", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT,
          D3D11_INPUT_PER_VERTEX_DATA, 0}};
 
-    HRESULT hResult = device_->CreateInputLayout(
+    HRESULT hResult = d3d11_device_->CreateInputLayout(
         inputElementDesc, ARRAYSIZE(inputElementDesc),
         vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
         input_layout_.GetAddressOf());
@@ -287,14 +346,83 @@ void MainWindow::InitializePaintContext() {
     D3D11_SUBRESOURCE_DATA vertexSubresourceData = {vertexData};
 
     HRESULT hResult =
-        device_->CreateBuffer(&vertexBufferDesc, &vertexSubresourceData,
-                              vertex_buffer_.GetAddressOf());
+        d3d11_device_->CreateBuffer(&vertexBufferDesc, &vertexSubresourceData,
+                                    vertex_buffer_.GetAddressOf());
     assert(SUCCEEDED(hResult));
+  }
+
+  ComPtr<IDXGIDevice> dxgi_device;
+  hr = d3d11_device_.As(&dxgi_device);
+  if (FAILED(hr)) {
+    OutputDebugStringFmt("d3d device failed to cast to dxgi device: hr: %lx",
+                         (long)hr);
+    _exit(1);
+  }
+
+  // Create DComp
+  ComPtr<IDCompositionDesktopDevice> desktop_device;
+  hr = DCompositionCreateDevice3(dxgi_device.Get(),
+                                 IID_PPV_ARGS(desktop_device.GetAddressOf()));
+  if (FAILED(hr)) {
+    OutputDebugStringFmt("DCompositionCreateDevice failed: hr: %lx", (long)hr);
+    _exit(1);
+  }
+
+  hr = desktop_device.As(&dcomp_device_);
+  if (FAILED(hr)) {
+    OutputDebugStringFmt(
+        "dcomp device failed to cast to desktop device: hr: %lx", (long)hr);
+    _exit(1);
+  }
+
+  hr = desktop_device->CreateTargetForHwnd(hwnd_, TRUE,
+                                           dcomp_target_.GetAddressOf());
+  if (FAILED(hr)) {
+    OutputDebugStringFmt("CreateTargetForHwnd failed: hr: %lx", (long)hr);
+    _exit(1);
+  }
+
+  hr = dcomp_device_->CreateVisual(&root_visual_);
+  if (FAILED(hr)) {
+    OutputDebugStringFmt("CreateRootVisual failed: hr: %lx", (long)hr);
+    _exit(1);
+  }
+
+  hr = dcomp_target_->SetRoot(root_visual_.Get());
+
+  if (FAILED(hr)) {
+    OutputDebugStringFmt("SetRoot failed: hr: %lx", (long)hr);
+    _exit(1);
+  }
+
+  if (1) {
+    // Fill the background so we have a consistent backdrop instead of relying
+    // on the color of the redirection surface when testing alpha blending. We
+    // default to magenta to make it obvious when something shouldn't be
+    // visible.
+    const float background_fill_color[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+    RECT winRect;
+    GetClientRect(hwnd_, &winRect);
+    int width = winRect.right - winRect.left;
+    int height = winRect.bottom - winRect.top;
+    ComPtr<IDCompositionVisual2> background_visual =
+        NewBackgroundVisual(dcomp_device_.Get(), d3d11_device_.Get(), width,
+                            height, background_fill_color);
+    AddVisualOnTop(background_visual.Get());
   }
 }
 
 void MainWindow::AddChild(std::shared_ptr<ChildWindow>& child) {
   children_.emplace_back(child);
+}
+
+void MainWindow::AddVisualOnTop(IDCompositionVisual2* visual) {
+  HRESULT hr = root_visual_->AddVisual(visual, TRUE, current_visual_.Get());
+  if (FAILED(hr)) {
+    OutputDebugStringFmt("AddVisual failed: hr: %lx", (long)hr);
+    _exit(1);
+  }
+  current_visual_ = visual;
 }
 
 ChildWindow::ChildWindow(HWND parent) : hwnd_parent_(parent) {}
@@ -309,6 +437,9 @@ void ChildWindow::OnParentSize(size_t x, size_t y, size_t width,
   SetWindowPos(hwnd_, insert_order, static_cast<INT>(x), static_cast<INT>(y),
                static_cast<INT>(width), static_cast<INT>(height), 0);
   InitializePaintContext();
+  // Must paint to get the content.
+  OnPaint();
+  InvalidateRect(hwnd_parent_, nullptr, FALSE);
 }
 
 void ChildWindow::OnPaint() {
@@ -335,8 +466,8 @@ void ChildWindow::OnPaint() {
     _exit(1);
   }
 
-  hr = device_->CreateRenderTargetView(back_buffer.Get(), nullptr,
-                                       render_target_view.GetAddressOf());
+  hr = d3d11_device_->CreateRenderTargetView(back_buffer.Get(), nullptr,
+                                             render_target_view.GetAddressOf());
   if (FAILED(hr)) {
     OutputDebugStringFmt("CreateRenderTargetView failed: hr: %lx", (long)hr);
     _exit(1);
@@ -373,8 +504,9 @@ void ChildWindow::OnPaint() {
 void ChildWindow::InitializePaintContext() {
   HRESULT hr;
   MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hwnd_parent_);
-  device_ = main_window->device();
+  d3d11_device_ = main_window->d3d11_device();
   context_ = main_window->context();
+  swap_chain_.Reset();
   DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {0};
   swapChainDesc.BufferCount = 2;
   swapChainDesc.Width = 0;
@@ -384,12 +516,46 @@ void ChildWindow::InitializePaintContext() {
   swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
   swapChainDesc.SampleDesc.Count = 1;
   hr = main_window->factory()->CreateSwapChainForHwnd(
-      device_.Get(), hwnd_, &swapChainDesc, nullptr, nullptr,
+      d3d11_device_.Get(), hwnd_, &swapChainDesc, nullptr, nullptr,
       swap_chain_.GetAddressOf());
   if (FAILED(hr)) {
     OutputDebugStringFmt("CreateSwapChainForHwnd failed: hr: %lx", (long)hr);
     _exit(1);
   }
+  // Init dcomp
+  ComPtr<IDCompositionDevice3> dcomp_device = main_window->dcomp_device();
+  ComPtr<IDCompositionVisual2> visual;
+
+  // New surface from window.
+  ComPtr<IUnknown> surface;
+  ComPtr<IDCompositionDesktopDevice> desktop_device;
+  ASSERT_HRESULT_SUCCEEDED(dcomp_device.As(&desktop_device));
+  ASSERT_HRESULT_SUCCEEDED(
+      desktop_device->CreateSurfaceFromHwnd(hwnd_, &surface));
+  ASSERT_HRESULT_SUCCEEDED(dcomp_device->CreateVisual(&visual));
+
+  hr = visual->SetContent(surface.Get());
+  if (FAILED(hr)) {
+    OutputDebugStringFmt("SetContent failed: hr: %lx", (long)hr);
+    _exit(1);
+  }
+
+  // Setup the clip
+  if (0) {
+    RECT winRect;
+    GetClientRect(hwnd_parent_, &winRect);
+    int width = winRect.right - winRect.left;
+    int height = winRect.bottom - winRect.top;
+    float background_fill_color[4] = {r_, g_, b_, a_};
+    ComPtr<IDCompositionVisual2> background_visual;
+    background_visual =
+        NewBackgroundVisual(dcomp_device.Get(), d3d11_device_.Get(), width,
+                            height, background_fill_color);
+    ASSERT_HRESULT_SUCCEEDED(
+        visual->AddVisual(background_visual.Get(), FALSE, nullptr));
+  }
+
+  main_window->AddVisualOnTop(visual.Get());
 }
 
 void ChildWindow::SetClearColor(float r, float g, float b, float a) {
@@ -418,6 +584,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance) {
   wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
   wcex.hbrBackground = (HBRUSH)(nullptr);
   wcex.lpszMenuName = MAKEINTRESOURCEW(IDC_HOLEPUNCHEXAMPLE);
+  wcex.lpszMenuName = nullptr;
   wcex.lpszClassName = szWindowClass;
   wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
 
@@ -463,9 +630,10 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
   hInst = hInstance;  // 将实例句柄存储在全局变量中
   std::unique_ptr<MainWindow> main_window = std::make_unique<MainWindow>();
 
-  HWND hWnd = CreateWindowExW(0, szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr,
-                              nullptr, hInstance, main_window.get());
+  HWND hWnd =
+      CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, szWindowClass, szTitle,
+                      WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0, CW_USEDEFAULT, 0,
+                      nullptr, nullptr, hInstance, main_window.get());
 
   if (!hWnd) {
     return FALSE;
@@ -476,16 +644,38 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
   std::unique_ptr<std::shared_ptr<ChildWindow>> child_window =
       std::make_unique<std::shared_ptr<ChildWindow>>(
           std::make_shared<ChildWindow>(hWnd));
-  // set top child background to red.
-  (*child_window)->SetClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-  main_window->AddChild(*child_window);
-  InitInstanceChild(hInstance, hWnd, child_window.release(), true);
-  child_window = std::make_unique<std::shared_ptr<ChildWindow>>(
-      std::make_shared<ChildWindow>(hWnd));
   // set bottom child background to green.
   (*child_window)->SetClearColor(0.0f, 1.0f, 0.0f, 1.0f);
   main_window->AddChild(*child_window);
   InitInstanceChild(hInstance, hWnd, child_window.release(), false);
+  if (true) {
+    child_window = std::make_unique<std::shared_ptr<ChildWindow>>(
+        std::make_shared<ChildWindow>(hWnd));
+    // set top child background to red.
+    (*child_window)->SetClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+    main_window->AddChild(*child_window);
+    InitInstanceChild(hInstance, hWnd, child_window.release(), true);
+  }
+  // Add debug visual to test src-over alpha blending.
+
+  if (0) {
+    // Fill the background so we have a consistent backdrop instead of relying
+    // on the color of the redirection surface when testing alpha blending. We
+    // default to magenta to make it obvious when something shouldn't be
+    // visible.
+    const float background_fill_color[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+    RECT winRect;
+    GetClientRect(hWnd, &winRect);
+    int width = winRect.right - winRect.left;
+    int height = winRect.bottom - winRect.top;
+    ComPtr<IDCompositionVisual2> background_visual = NewBackgroundVisual(
+        main_window->dcomp_device(), main_window->d3d11_device(), width, height,
+        background_fill_color);
+    // ComPtr<IDCompositionVisual3> background_visual3;
+    // ASSERT_HRESULT_SUCCEEDED(background_visual.As(&background_visual3));
+    // ASSERT_HRESULT_SUCCEEDED(background_visual3->SetOpacity(0.4f));
+    main_window->AddVisualOnTop(background_visual.Get());
+  }
   main_window.release();
 
   UpdateWindow(hWnd);
@@ -497,13 +687,18 @@ HWND InitInstanceChild(HINSTANCE hInstance, HWND parent,
                        std::shared_ptr<ChildWindow>* child_window, bool ontop) {
   hInst = hInstance;  // 将实例句柄存储在全局变量中
 
-  DWORD ex_style = 0;
-  HWND hWnd = CreateWindowExW(
-      ex_style, L"childwindow", L"", WS_CHILD | WS_VISIBLE, CW_USEDEFAULT, 0,
-      CW_USEDEFAULT, 0, parent, nullptr, hInstance, nullptr);
+  DWORD ex_style = WS_EX_NOPARENTNOTIFY | WS_EX_LAYERED | WS_EX_TRANSPARENT |
+                   WS_EX_NOREDIRECTIONBITMAP;
+  HWND hWnd = CreateWindowExW(ex_style, L"childwindow", L"",
+                              WS_CHILDWINDOW | WS_DISABLED | WS_VISIBLE, 0, 100,
+                              0, 100, parent, nullptr, hInstance, nullptr);
 
   if (!hWnd) {
-    OutputDebugStringFmt("Create child window failed: %lx.", GetLastError());
+    DWORD error_code = GetLastError();
+    wchar_t error_message[256];
+    swprintf_s(error_message, L"Failed to create child window: Error %lu",
+               error_code);
+    MessageBox(NULL, error_message, L"Error", MB_ICONEXCLAMATION | MB_OK);
     _exit(1);
   }
 
@@ -521,6 +716,7 @@ HWND InitInstanceChild(HINSTANCE hInstance, HWND parent,
   (*child_window)
       ->OnParentSize(0, 0, winRect.right - winRect.left,
                      winRect.bottom - winRect.top);
+
   if (ontop && false) {
     int width = winRect.right - winRect.left;
     int height = winRect.bottom - winRect.top;
@@ -593,6 +789,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       PAINTSTRUCT ps;
       HDC hdc = BeginPaint(hWnd, &ps);
       // TODO: 在此处添加使用 hdc 的任何绘图代码...
+      MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hWnd);
+      main_window->OnPaint();
       EndPaint(hWnd, &ps);
     } break;
     case WM_DESTROY: {

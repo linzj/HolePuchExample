@@ -46,4 +46,7 @@
       <Filter>资源文件</Filter>
     </Image>
   </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="HolePunchExample.manifest\HolePunchExample.manifest" />
+  </ItemGroup>
 </Project>
