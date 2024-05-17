@@ -65,7 +65,8 @@ void OutputDebugStringFmt(const char* format, ...) {
 float getRandomFloat() {
   static std::random_device rd;   // Obtain a random number from hardware
   static std::mt19937 gen(rd());  // Seed the generator
-  static std::uniform_real_distribution<> dis(0.0f, 1.0f);  // Define the range
+  static std::uniform_real_distribution<float> dis(0.0f,
+                                                   1.0f);  // Define the range
   return dis(gen);
 }
 
