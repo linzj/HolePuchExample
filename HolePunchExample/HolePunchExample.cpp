@@ -11,6 +11,7 @@
 #include <wrl/client.h>  // For ComPtr
 
 #include <memory>
+#include <random>
 #include <vector>
 
 #include "framework.h"
@@ -57,26 +58,15 @@ void OutputDebugStringFmt(const char* format, ...) {
   vsprintf_s(buffer, format, args);
   va_end(args);
   OutputDebugStringA(buffer);
+  OutputDebugStringA("\n");
 }
 
-// Function to set a hole in a window
-void SetWindowHole(HWND hwnd, int holeX, int holeY, int holeWidth,
-                   int holeHeight, int width, int height) {
-  // Create a region that covers the whole window
-  HRGN hrgnWhole = CreateRectRgn(0, 0, width, height);
-
-  // Create a region for the hole
-  HRGN hrgnHole =
-      CreateRectRgn(holeX, holeY, holeX + holeWidth, holeY + holeHeight);
-
-  // Combine the regions to subtract the hole from the whole
-  CombineRgn(hrgnWhole, hrgnWhole, hrgnHole, RGN_DIFF);
-
-  // Set the new region for the window
-  SetWindowRgn(hwnd, hrgnWhole, TRUE);
-
-  // Clean up
-  DeleteObject(hrgnHole);
+// Function to generate a random float in range [0.0f, 1.0f]
+float getRandomFloat() {
+  static std::random_device rd;   // Obtain a random number from hardware
+  static std::mt19937 gen(rd());  // Seed the generator
+  static std::uniform_real_distribution<> dis(0.0f, 1.0f);  // Define the range
+  return dis(gen);
 }
 
 ComPtr<IDCompositionVisual2> NewBackgroundVisual(
@@ -129,8 +119,10 @@ class MainWindow : public WindowBase {
   void OnCreate(HWND hwnd);
   void OnSize(size_t x, size_t y, size_t width, size_t height);
   void OnPaint();
+  void RepaintChildren();
   void AddChild(std::shared_ptr<ChildWindow>& child);
   void AddVisualOnTop(IDCompositionVisual2*);
+  void DrawHalfRect(float[4]);
   ID3D11Device* d3d11_device() { return d3d11_device_.Get(); }
   ID3D11DeviceContext* context() { return context_.Get(); }
   IDXGIFactory2* factory() { return factory_.Get(); }
@@ -160,6 +152,7 @@ class MainWindow : public WindowBase {
   ComPtr<ID3D11PixelShader> pixel_shader_;
   ComPtr<ID3D11InputLayout> input_layout_;
   ComPtr<ID3D11Buffer> vertex_buffer_;
+  // DComps
   ComPtr<IDCompositionDevice3> dcomp_device_;
   ComPtr<IDCompositionTarget> dcomp_target_;
   ComPtr<IDCompositionVisual2> root_visual_;
@@ -213,6 +206,7 @@ void MainWindow::OnCreate(HWND hWnd) {
   hwnd_ = hWnd;
   SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
   InitializePaintContext();
+  SetTimer(hwnd_, 0, 1000, nullptr);
 }
 
 void MainWindow::OnSize(size_t x, size_t y, size_t width, size_t height) {
@@ -224,6 +218,13 @@ void MainWindow::OnSize(size_t x, size_t y, size_t width, size_t height) {
 }
 
 void MainWindow::OnPaint() { dcomp_device_->Commit(); }
+
+void MainWindow::RepaintChildren() {
+  for (auto& weak_child : children_) {
+    auto child = weak_child.lock();
+    if (child) child->OnPaint();
+  }
+}
 
 void MainWindow::InitializePaintContext() {
 #ifdef _DEBUG
@@ -425,6 +426,36 @@ void MainWindow::AddVisualOnTop(IDCompositionVisual2* visual) {
   current_visual_ = visual;
 }
 
+void MainWindow::DrawHalfRect(float color[4]) {
+  HRESULT hr;
+  context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_->IASetInputLayout(input_layout());
+
+  context_->VSSetShader(vertex_shader(), nullptr, 0);
+  context_->PSSetShader(pixel_shader(), nullptr, 0);
+
+  context_->IASetVertexBuffers(0, 1, vertex_buffer_address(), stride_address(),
+                               offset_address());
+
+  // Create rect_color_buffer
+  ComPtr<ID3D11Buffer> rect_color_buffer;
+
+  D3D11_BUFFER_DESC bufferDesc;
+  ZeroMemory(&bufferDesc, sizeof(D3D11_BUFFER_DESC));
+  bufferDesc.Usage = D3D11_USAGE_DEFAULT;
+  bufferDesc.ByteWidth = sizeof(float[4]);
+  bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  bufferDesc.CPUAccessFlags = 0;
+
+  D3D11_SUBRESOURCE_DATA initData;
+  initData.pSysMem = color;
+  ASSERT_HRESULT_SUCCEEDED(
+      d3d11_device_->CreateBuffer(&bufferDesc, &initData, &rect_color_buffer));
+  ID3D11Buffer* rect_color_buffer_raw = rect_color_buffer.Get();
+  context_->PSSetConstantBuffers(0, 1, &rect_color_buffer_raw);
+  context_->Draw(num_verts(), 0);
+}
+
 ChildWindow::ChildWindow(HWND parent) : hwnd_parent_(parent) {}
 
 ChildWindow::~ChildWindow() {}
@@ -475,22 +506,18 @@ void ChildWindow::OnPaint() {
   context_->ClearRenderTargetView(render_target_view.Get(), clearColor);
 
   // Clear center if on top
+  MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hwnd_parent_);
   if (ontop_) {
-    MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hwnd_parent_);
-    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context_->IASetInputLayout(main_window->input_layout());
-
-    context_->VSSetShader(main_window->vertex_shader(), nullptr, 0);
-    context_->PSSetShader(main_window->pixel_shader(), nullptr, 0);
-
-    context_->IASetVertexBuffers(0, 1, main_window->vertex_buffer_address(),
-                                 main_window->stride_address(),
-                                 main_window->offset_address());
-
-    context_->Draw(main_window->num_verts(), 0);
+    float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    main_window->DrawHalfRect(color);
   } else {
-    OutputDebugStringFmt("draw nothing! %d, %d %d %d", winRect.left,
-                         winRect.right, winRect.top, winRect.bottom);
+    // Generate random color values for red, green, and blue
+    float r = getRandomFloat();
+    float g = getRandomFloat();
+    float b = getRandomFloat();
+    OutputDebugStringFmt("rand color: %f, %f %f.", r, g, b);
+    float color[4] = {r, g, b, 1.0f};
+    main_window->DrawHalfRect(color);
   }
 
   // Present back buffer in vsync
@@ -712,6 +739,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       main_window->OnSize(0, 0, LOWORD(lParam), HIWORD(lParam));
       break;
     }
+    case WM_TIMER: {
+      MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hWnd);
+      main_window->RepaintChildren();
+      SetTimer(hWnd, 0, 1000, nullptr);
+    } break;
     default:
       return DefWindowProc(hWnd, message, wParam, lParam);
   }

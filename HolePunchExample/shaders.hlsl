@@ -1,3 +1,7 @@
+cbuffer ColorBuffer : register(b0)
+{
+    float4 color;
+}
 
 struct VS_Input {
     float2 pos : POS;
@@ -18,5 +22,5 @@ VS_Output vs_main(VS_Input input)
 
 float4 ps_main(VS_Output input) : SV_Target
 {
-    return float4(0.0, 0.0, 0.0, 0.0);
+  return color;
 }
