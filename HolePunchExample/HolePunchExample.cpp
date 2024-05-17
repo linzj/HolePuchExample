@@ -632,17 +632,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
   main_window->OnCreate(hWnd);
 
   ShowWindow(hWnd, nCmdShow);
-  std::unique_ptr<std::shared_ptr<ChildWindow>> child_window =
-      std::make_unique<std::shared_ptr<ChildWindow>>(
-          std::make_shared<ChildWindow>(hWnd));
-  // set bottom child background to green.
-  (*child_window)->SetClearColor(0.0f, 1.0f, 0.0f, 1.0f);
-  (*child_window)->SetDrawColorGenerator(std::move([](float outcolor[4]) {
-    float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    memcpy(outcolor, color, sizeof(float[4]));
-  }));
-  main_window->AddChild(*child_window);
-  InitInstanceChild(hInstance, hWnd, child_window.release(), false);
+  std::unique_ptr<std::shared_ptr<ChildWindow>> child_window;
   if (true) {
     child_window = std::make_unique<std::shared_ptr<ChildWindow>>(
         std::make_shared<ChildWindow>(hWnd));
@@ -660,6 +650,16 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     main_window->AddChild(*child_window);
     InitInstanceChild(hInstance, hWnd, child_window.release(), true);
   }
+  child_window = std::make_unique<std::shared_ptr<ChildWindow>>(
+      std::make_shared<ChildWindow>(hWnd));
+  // set bottom child background to green.
+  (*child_window)->SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  (*child_window)->SetDrawColorGenerator(std::move([](float outcolor[4]) {
+    float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    memcpy(outcolor, color, sizeof(float[4]));
+  }));
+  main_window->AddChild(*child_window);
+  InitInstanceChild(hInstance, hWnd, child_window.release(), false);
   // Add debug visual to test src-over alpha blending.
 
   if (0) {
