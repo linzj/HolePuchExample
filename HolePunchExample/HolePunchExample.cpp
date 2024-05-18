@@ -65,7 +65,7 @@ float getRandomFloat() {
   static std::random_device rd;   // Obtain a random number from hardware
   static std::mt19937 gen(rd());  // Seed the generator
   static std::uniform_real_distribution<float> dis(1.0f,
-                                                   16.0f);  // Define the range
+                                                   8.0f);  // Define the range
   return dis(gen);
 }
 
@@ -182,7 +182,6 @@ class ContentLayer {
   explicit ContentLayer(GraphicContext* graphic_context);
   ~ContentLayer();
 
-  void set_on_top(bool ontop) { ontop_ = ontop; }
   void Init(bool ontop);
   void OnWindowSize(size_t x, size_t y, size_t width, size_t height);
   void OnPaint();
@@ -563,7 +562,8 @@ void ContentLayer::InitializePaintContext() {
   scd.Scaling = DXGI_SCALING_STRETCH;
   scd.Width = width;
   scd.Height = height;
-  scd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  scd.Format =
+      ontop_ ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
   scd.Stereo = FALSE;
   scd.BufferUsage = DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_RENDER_TARGET_OUTPUT;
   scd.Flags = 0;
@@ -696,7 +696,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
         }));
     content_layer->AddDrawColorGenerator(
         std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
-          float color[4] = {0.2f, 0.2f, 0.2f, 0.2f};
+          float color[4] = {0.2f, 0.2f, 0.2f, 0.3f};
           memcpy(outcolor, color, sizeof(float[4]));
           RECT winRect;
           GetClientRect(hWnd, &winRect);
