@@ -36,7 +36,7 @@ using Microsoft::WRL::ComPtr;
   }
 
 namespace {
-class ChildWindow;
+class ContentLayer;
 
 // 全局变量:
 HINSTANCE hInst;                      // 当前实例
@@ -47,8 +47,6 @@ WCHAR szWindowClass[MAX_LOADSTRING];  // 主窗口类名
 ATOM MyRegisterClass(HINSTANCE hInstance);
 ATOM MyRegisterChildClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
-void InitInstanceChild(HINSTANCE hInstance, HWND parent,
-                       std::shared_ptr<ChildWindow>* child_window, bool ontop);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 
@@ -114,17 +112,10 @@ class WindowBase {
   static T* FromHWND(HWND hWnd);
 };
 
-class MainWindow : public WindowBase {
+class GraphicContext {
  public:
-  MainWindow();
-  ~MainWindow();
-  void OnCreate(HWND hwnd);
-  void OnSize(size_t x, size_t y, size_t width, size_t height);
-  void OnPaint();
-  void RepaintChildren();
-  void AddChild(std::shared_ptr<ChildWindow>& child);
-  void AddVisualOnTop(IDCompositionVisual2*);
-  void DrawHalfRect(float[4]);
+  explicit GraphicContext(HWND hwnd);
+  ~GraphicContext();
   ID3D11Device* d3d11_device() { return d3d11_device_.Get(); }
   ID3D11DeviceContext* context() { return context_.Get(); }
   IDXGIFactory2* factory() { return factory_.Get(); }
@@ -133,19 +124,20 @@ class MainWindow : public WindowBase {
   ID3D11InputLayout* input_layout() { return input_layout_.Get(); }
   IDCompositionDevice3* dcomp_device() { return dcomp_device_.Get(); }
   IDCompositionVisual2* root_visual() { return root_visual_.Get(); }
-
   ID3D11Buffer** vertex_buffer_address() {
     return vertex_buffer_.GetAddressOf();
   }
-
+  HWND window() { return hwnd_; }
   UINT num_verts() { return num_verts_; }
   UINT* stride_address() { return &stride_; }
   UINT* offset_address() { return &offset_; }
 
- private:
-  void InitializePaintContext();
+  RECT GetClientRect();
+  void AddVisualOnTop(IDCompositionVisual2*);
+  void DrawHalfRect(float[4]);
+  void Initialize();
 
-  std::vector<std::weak_ptr<ChildWindow>> children_;
+ private:
   // Define variables to hold the Device and Device Context interfaces
   ComPtr<ID3D11Device> d3d11_device_;
   ComPtr<ID3D11DeviceContext> context_;
@@ -166,13 +158,33 @@ class MainWindow : public WindowBase {
   HWND hwnd_ = nullptr;
 };
 
-class ChildWindow : public WindowBase {
+class MainWindow : public WindowBase {
  public:
-  explicit ChildWindow(HWND parent);
-  ~ChildWindow();
+  MainWindow();
+  ~MainWindow();
+  void OnCreate(HWND hwnd);
+  void OnSize(size_t x, size_t y, size_t width, size_t height);
+  void OnPaint();
+  void RepaintChildren();
+  void AddContentLayer(std::unique_ptr<ContentLayer>&& content);
+  GraphicContext* graphic_context() { return graphic_context_.get(); }
+
+ private:
+  void InitializePaintContext();
+
+  std::vector<std::unique_ptr<ContentLayer>> content_layers_;
+  std::unique_ptr<GraphicContext> graphic_context_;
+  HWND hwnd_ = nullptr;
+};
+
+class ContentLayer {
+ public:
+  explicit ContentLayer(GraphicContext* graphic_context);
+  ~ContentLayer();
 
   void set_on_top(bool ontop) { ontop_ = ontop; }
-  void OnParentSize(size_t x, size_t y, size_t width, size_t height);
+  void Init(bool ontop);
+  void OnWindowSize(size_t x, size_t y, size_t width, size_t height);
   void OnPaint();
   void SetClearColor(float r, float g, float b, float a);
   void AddDrawColorGenerator(
@@ -180,7 +192,7 @@ class ChildWindow : public WindowBase {
 
  private:
   void InitializePaintContext();
-  HWND hwnd_parent_;
+  GraphicContext* graphic_context_;
   ComPtr<ID3D11Device> d3d11_device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<IDXGISwapChain1> swap_chain_;
@@ -205,34 +217,46 @@ T* WindowBase::FromHWND(HWND hWnd) {
   return reinterpret_cast<T*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
 }
 
-MainWindow::MainWindow() {}
-MainWindow::~MainWindow() {}
+GraphicContext::GraphicContext(HWND hwnd) : hwnd_(hwnd) {}
+GraphicContext::~GraphicContext() {}
 
-void MainWindow::OnCreate(HWND hWnd) {
-  hwnd_ = hWnd;
-  SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-  InitializePaintContext();
-  SetTimer(hwnd_, 0, 1000, nullptr);
+RECT GraphicContext::GetClientRect() {
+  RECT rect;
+  ::GetClientRect(hwnd_, &rect);
+  return rect;
 }
 
-void MainWindow::OnSize(size_t x, size_t y, size_t width, size_t height) {
-  if (width == 0 || height == 0) return;
-  for (auto& weak_child : children_) {
-    auto child = weak_child.lock();
-    if (child) child->OnParentSize(x, y, width, height);
-  }
+void GraphicContext::DrawHalfRect(float color[4]) {
+  HRESULT hr;
+  context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context_->IASetInputLayout(input_layout());
+
+  context_->VSSetShader(vertex_shader(), nullptr, 0);
+  context_->PSSetShader(pixel_shader(), nullptr, 0);
+
+  context_->IASetVertexBuffers(0, 1, vertex_buffer_address(), stride_address(),
+                               offset_address());
+
+  // Create rect_color_buffer
+  ComPtr<ID3D11Buffer> rect_color_buffer;
+
+  D3D11_BUFFER_DESC bufferDesc;
+  ZeroMemory(&bufferDesc, sizeof(D3D11_BUFFER_DESC));
+  bufferDesc.Usage = D3D11_USAGE_DEFAULT;
+  bufferDesc.ByteWidth = sizeof(float[4]);
+  bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  bufferDesc.CPUAccessFlags = 0;
+
+  D3D11_SUBRESOURCE_DATA initData;
+  initData.pSysMem = color;
+  ASSERT_HRESULT_SUCCEEDED(
+      d3d11_device_->CreateBuffer(&bufferDesc, &initData, &rect_color_buffer));
+  ID3D11Buffer* rect_color_buffer_raw = rect_color_buffer.Get();
+  context_->PSSetConstantBuffers(0, 1, &rect_color_buffer_raw);
+  context_->Draw(num_verts(), 0);
 }
 
-void MainWindow::OnPaint() { dcomp_device_->Commit(); }
-
-void MainWindow::RepaintChildren() {
-  for (auto& weak_child : children_) {
-    auto child = weak_child.lock();
-    if (child) child->OnPaint();
-  }
-}
-
-void MainWindow::InitializePaintContext() {
+void GraphicContext::Initialize() {
 #ifdef _DEBUG
   UINT createDeviceFlags = D3D11_CREATE_DEVICE_DEBUG;
 #else
@@ -254,13 +278,11 @@ void MainWindow::InitializePaintContext() {
   }
   // Set up debug layer to break on D3D11 errors
   ComPtr<ID3D11Debug> d3dDebug;
-  d3d11_device_->QueryInterface(
-      __uuidof(ID3D11Debug), reinterpret_cast<void**>(d3dDebug.GetAddressOf()));
+  d3d11_device_->QueryInterface(IID_PPV_ARGS(d3dDebug.GetAddressOf()));
   if (d3dDebug) {
     ComPtr<ID3D11InfoQueue> d3dInfoQueue;
     if (SUCCEEDED(d3dDebug->QueryInterface(
-            __uuidof(ID3D11InfoQueue),
-            reinterpret_cast<void**>(d3dInfoQueue.GetAddressOf())))) {
+            IID_PPV_ARGS(d3dInfoQueue.GetAddressOf())))) {
       d3dInfoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, true);
       d3dInfoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, true);
     }
@@ -408,8 +430,7 @@ void MainWindow::InitializePaintContext() {
     // default to magenta to make it obvious when something shouldn't be
     // visible.
     const float background_fill_color[4] = {1.0f, 1.0f, 0.0f, 1.0f};
-    RECT winRect;
-    GetClientRect(hwnd_, &winRect);
+    RECT winRect = GetClientRect();
     int width = winRect.right - winRect.left;
     int height = winRect.bottom - winRect.top;
     ComPtr<IDCompositionVisual2> background_visual =
@@ -419,11 +440,7 @@ void MainWindow::InitializePaintContext() {
   }
 }
 
-void MainWindow::AddChild(std::shared_ptr<ChildWindow>& child) {
-  children_.emplace_back(child);
-}
-
-void MainWindow::AddVisualOnTop(IDCompositionVisual2* visual) {
+void GraphicContext::AddVisualOnTop(IDCompositionVisual2* visual) {
   HRESULT hr = root_visual_->AddVisual(visual, TRUE, current_visual_.Get());
   if (FAILED(hr)) {
     OutputDebugStringFmt("AddVisual failed: hr: %lx", (long)hr);
@@ -432,56 +449,68 @@ void MainWindow::AddVisualOnTop(IDCompositionVisual2* visual) {
   current_visual_ = visual;
 }
 
-void MainWindow::DrawHalfRect(float color[4]) {
-  HRESULT hr;
-  context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  context_->IASetInputLayout(input_layout());
+MainWindow::MainWindow() {}
+MainWindow::~MainWindow() {}
 
-  context_->VSSetShader(vertex_shader(), nullptr, 0);
-  context_->PSSetShader(pixel_shader(), nullptr, 0);
+void MainWindow::OnCreate(HWND hWnd) {
+  hwnd_ = hWnd;
+  SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
 
-  context_->IASetVertexBuffers(0, 1, vertex_buffer_address(), stride_address(),
-                               offset_address());
-
-  // Create rect_color_buffer
-  ComPtr<ID3D11Buffer> rect_color_buffer;
-
-  D3D11_BUFFER_DESC bufferDesc;
-  ZeroMemory(&bufferDesc, sizeof(D3D11_BUFFER_DESC));
-  bufferDesc.Usage = D3D11_USAGE_DEFAULT;
-  bufferDesc.ByteWidth = sizeof(float[4]);
-  bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-  bufferDesc.CPUAccessFlags = 0;
-
-  D3D11_SUBRESOURCE_DATA initData;
-  initData.pSysMem = color;
-  ASSERT_HRESULT_SUCCEEDED(
-      d3d11_device_->CreateBuffer(&bufferDesc, &initData, &rect_color_buffer));
-  ID3D11Buffer* rect_color_buffer_raw = rect_color_buffer.Get();
-  context_->PSSetConstantBuffers(0, 1, &rect_color_buffer_raw);
-  context_->Draw(num_verts(), 0);
+  InitializePaintContext();
+  SetTimer(hwnd_, 0, 1000, nullptr);
 }
 
-ChildWindow::ChildWindow(HWND parent) : hwnd_parent_(parent) {}
+void MainWindow::OnSize(size_t x, size_t y, size_t width, size_t height) {
+  if (width == 0 || height == 0) return;
+  for (auto& content_layer : content_layers_) {
+    content_layer->OnWindowSize(x, y, width, height);
+  }
+}
 
-ChildWindow::~ChildWindow() {}
+void MainWindow::OnPaint() { graphic_context_->dcomp_device()->Commit(); }
 
-void ChildWindow::OnParentSize(size_t x, size_t y, size_t width,
-                               size_t height) {
+void MainWindow::RepaintChildren() {
+  for (auto& content_layer : content_layers_) {
+    content_layer->OnPaint();
+  }
+}
+
+void MainWindow::AddContentLayer(std::unique_ptr<ContentLayer>&& content) {
+  content_layers_.emplace_back(std::move(content));
+}
+
+void MainWindow::InitializePaintContext() {
+  graphic_context_ = std::make_unique<GraphicContext>(hwnd_);
+  graphic_context_->Initialize();
+}
+
+ContentLayer::ContentLayer(GraphicContext* graphic_context)
+    : graphic_context_(graphic_context) {}
+
+ContentLayer::~ContentLayer() {}
+
+void ContentLayer::Init(bool ontop) {
+  ontop_ = ontop;
+  // Resize the content now.
+  RECT winRect = graphic_context_->GetClientRect();
+  OnWindowSize(0, 0, winRect.right - winRect.left,
+               winRect.bottom - winRect.top);
+}
+
+void ContentLayer::OnWindowSize(size_t x, size_t y, size_t width,
+                                size_t height) {
   InitializePaintContext();
   // Must paint to get the content.
   OnPaint();
-  InvalidateRect(hwnd_parent_, nullptr, FALSE);
+  InvalidateRect(graphic_context_->window(), nullptr, FALSE);
 }
 
-void ChildWindow::OnPaint() {
+void ContentLayer::OnPaint() {
   // Create render target view
   ComPtr<ID3D11Texture2D> back_buffer;
   ComPtr<ID3D11RenderTargetView> render_target_view;
   HRESULT hr;
-  hr = swap_chain_->GetBuffer(
-      0, __uuidof(ID3D11Texture2D),
-      reinterpret_cast<void**>(back_buffer.GetAddressOf()));
+  hr = swap_chain_->GetBuffer(0, IID_PPV_ARGS(back_buffer.GetAddressOf()));
   if (FAILED(hr)) {
     OutputDebugStringFmt("GetBuffer failed: hr: %lx", (long)hr);
     _exit(1);
@@ -500,31 +529,28 @@ void ChildWindow::OnPaint() {
   context_->ClearRenderTargetView(render_target_view.Get(), clearColor);
 
   // Clear center if on top
-  MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hwnd_parent_);
   for (auto& generator : draw_color_generators_) {
     float color[4];
     D3D11_VIEWPORT viewport;
     generator(color, viewport);
     context_->RSSetViewports(1, &viewport);
-    main_window->DrawHalfRect(color);
+    graphic_context_->DrawHalfRect(color);
   }
 
   // Present back buffer in vsync
   swap_chain_->Present(0, 0);
 }
 
-void ChildWindow::InitializePaintContext() {
+void ContentLayer::InitializePaintContext() {
   HRESULT hr;
-  MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hwnd_parent_);
-  d3d11_device_ = main_window->d3d11_device();
-  context_ = main_window->context();
+  d3d11_device_ = graphic_context_->d3d11_device();
+  context_ = graphic_context_->context();
   swap_chain_.Reset();
-  RECT winRect;
-  GetClientRect(hwnd_parent_, &winRect);
+  RECT winRect = graphic_context_->GetClientRect();
   int width = winRect.right - winRect.left;
   int height = winRect.bottom - winRect.top;
   // Init dcomp
-  ComPtr<IDCompositionDevice3> dcomp_device = main_window->dcomp_device();
+  ComPtr<IDCompositionDevice3> dcomp_device = graphic_context_->dcomp_device();
   ComPtr<IDCompositionVisual2> visual;
 
   ASSERT_HRESULT_SUCCEEDED(dcomp_device->CreateVisual(&visual));
@@ -545,7 +571,7 @@ void ChildWindow::InitializePaintContext() {
   scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
 
   ASSERT_HRESULT_SUCCEEDED(
-      main_window->factory()->CreateSwapChainForComposition(
+      graphic_context_->factory()->CreateSwapChainForComposition(
           d3d11_device_.Get(), &scd, NULL, &swap_chain_));
   ASSERT_HRESULT_SUCCEEDED(visual->SetContent(swap_chain_.Get()));
 
@@ -560,17 +586,17 @@ void ChildWindow::InitializePaintContext() {
         visual->AddVisual(background_visual.Get(), FALSE, nullptr));
   }
 
-  main_window->AddVisualOnTop(visual.Get());
+  graphic_context_->AddVisualOnTop(visual.Get());
 }
 
-void ChildWindow::SetClearColor(float r, float g, float b, float a) {
+void ContentLayer::SetClearColor(float r, float g, float b, float a) {
   r_ = r;
   g_ = g;
   b_ = b;
   a_ = a;
 }
 
-void ChildWindow::AddDrawColorGenerator(
+void ContentLayer::AddDrawColorGenerator(
     std::function<void(float[4], D3D11_VIEWPORT&)>&& draw_color_generator) {
   draw_color_generators_.emplace_back(std::move(draw_color_generator));
 }
@@ -626,68 +652,64 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
   main_window->OnCreate(hWnd);
 
   ShowWindow(hWnd, nCmdShow);
-  std::unique_ptr<std::shared_ptr<ChildWindow>> child_window =
-      std::make_unique<std::shared_ptr<ChildWindow>>(
-          std::make_shared<ChildWindow>(hWnd));
-  // set bottom child background to green.
-  (*child_window)->SetClearColor(0.0f, 1.0f, 0.0f, 1.0f);
-  (*child_window)
-      ->AddDrawColorGenerator(
-          std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
-            // Generate random color values for red, green, and blue
-            float r = getRandomFloat();
-            float g = getRandomFloat();
-            float b = getRandomFloat();
-            OutputDebugStringFmt("rand color: %f, %f %f.", r, g, b);
-            float color[4] = {r, g, b, 1.0f};
-            memcpy(outcolor, color, sizeof(float[4]));
-            RECT winRect;
-            GetClientRect(hWnd, &winRect);
-            viewport = D3D11_VIEWPORT{0.0f,
-                                      0.0f,
-                                      (FLOAT)(winRect.right - winRect.left),
-                                      (FLOAT)(winRect.bottom - winRect.top),
-                                      0.0f,
-                                      1.0f};
-          }));
-  main_window->AddChild(*child_window);
-  InitInstanceChild(hInstance, hWnd, child_window.release(), false);
+  std::unique_ptr<ContentLayer> content_layer =
+      std::make_unique<ContentLayer>(main_window->graphic_context());
+  // set bottom content background to green.
+  content_layer->SetClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+  content_layer->AddDrawColorGenerator(
+      std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
+        // Generate random color values for red, green, and blue
+        float r = getRandomFloat();
+        float g = getRandomFloat();
+        float b = getRandomFloat();
+        OutputDebugStringFmt("rand color: %f, %f %f.", r, g, b);
+        float color[4] = {r, g, b, 1.0f};
+        memcpy(outcolor, color, sizeof(float[4]));
+        RECT winRect;
+        GetClientRect(hWnd, &winRect);
+        viewport = D3D11_VIEWPORT{0.0f,
+                                  0.0f,
+                                  (FLOAT)(winRect.right - winRect.left),
+                                  (FLOAT)(winRect.bottom - winRect.top),
+                                  0.0f,
+                                  1.0f};
+      }));
+  content_layer->Init(false);
+  main_window->AddContentLayer(std::move(content_layer));
   if (true) {
-    child_window = std::make_unique<std::shared_ptr<ChildWindow>>(
-        std::make_shared<ChildWindow>(hWnd));
-    // set top child background to red.
-    (*child_window)->SetClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-    (*child_window)
-        ->AddDrawColorGenerator(
-            std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
-              float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-              memcpy(outcolor, color, sizeof(float[4]));
-              RECT winRect;
-              GetClientRect(hWnd, &winRect);
-              viewport = D3D11_VIEWPORT{0.0f,
-                                        0.0f,
-                                        (FLOAT)(winRect.right - winRect.left),
-                                        (FLOAT)(winRect.bottom - winRect.top),
-                                        0.0f,
-                                        1.0f};
-            }));
-    (*child_window)
-        ->AddDrawColorGenerator(
-            std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
-              float color[4] = {0.1f, 0.1f, 0.1f, 0.0f};
-              memcpy(outcolor, color, sizeof(float[4]));
-              RECT winRect;
-              GetClientRect(hWnd, &winRect);
-              viewport = D3D11_VIEWPORT{
-                  static_cast<FLOAT>(winRect.right - winRect.left) / 4.0f,
-                  static_cast<FLOAT>(winRect.bottom - winRect.top) / 4.0f,
-                  static_cast<FLOAT>(winRect.right - winRect.left) / 2.0f,
-                  static_cast<FLOAT>(winRect.bottom - winRect.top) / 2.0f,
-                  0.0f,
-                  1.0f};
-            }));
-    main_window->AddChild(*child_window);
-    InitInstanceChild(hInstance, hWnd, child_window.release(), true);
+    content_layer =
+        std::make_unique<ContentLayer>(main_window->graphic_context());
+    // set top content background to red.
+    content_layer->SetClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+    content_layer->AddDrawColorGenerator(
+        std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
+          float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+          memcpy(outcolor, color, sizeof(float[4]));
+          RECT winRect;
+          GetClientRect(hWnd, &winRect);
+          viewport = D3D11_VIEWPORT{0.0f,
+                                    0.0f,
+                                    (FLOAT)(winRect.right - winRect.left),
+                                    (FLOAT)(winRect.bottom - winRect.top),
+                                    0.0f,
+                                    1.0f};
+        }));
+    content_layer->AddDrawColorGenerator(
+        std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
+          float color[4] = {0.2f, 0.2f, 0.2f, 0.2f};
+          memcpy(outcolor, color, sizeof(float[4]));
+          RECT winRect;
+          GetClientRect(hWnd, &winRect);
+          viewport = D3D11_VIEWPORT{
+              static_cast<FLOAT>(winRect.right - winRect.left) / 4.0f,
+              static_cast<FLOAT>(winRect.bottom - winRect.top) / 4.0f,
+              static_cast<FLOAT>(winRect.right - winRect.left) / 2.0f,
+              static_cast<FLOAT>(winRect.bottom - winRect.top) / 2.0f,
+              0.0f,
+              1.0f};
+        }));
+    content_layer->Init(true);
+    main_window->AddContentLayer(std::move(content_layer));
   }
   // Add debug visual to test src-over alpha blending.
 
@@ -697,35 +719,23 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     // default to magenta to make it obvious when something shouldn't be
     // visible.
     const float background_fill_color[4] = {0.0f, 0.0f, 1.0f, 0.0f};
-    RECT winRect;
-    GetClientRect(hWnd, &winRect);
+    GraphicContext* graphic_context = main_window->graphic_context();
+    RECT winRect = graphic_context->GetClientRect();
     int width = winRect.right - winRect.left;
     int height = winRect.bottom - winRect.top;
     ComPtr<IDCompositionVisual2> background_visual = NewBackgroundVisual(
-        main_window->dcomp_device(), main_window->d3d11_device(), width, height,
-        background_fill_color);
+        graphic_context->dcomp_device(), graphic_context->d3d11_device(), width,
+        height, background_fill_color);
     // ComPtr<IDCompositionVisual3> background_visual3;
     // ASSERT_HRESULT_SUCCEEDED(background_visual.As(&background_visual3));
     // ASSERT_HRESULT_SUCCEEDED(background_visual3->SetOpacity(0.4f));
-    main_window->AddVisualOnTop(background_visual.Get());
+    graphic_context->AddVisualOnTop(background_visual.Get());
   }
   main_window.release();
 
   UpdateWindow(hWnd);
 
   return TRUE;
-}
-
-void InitInstanceChild(HINSTANCE hInstance, HWND parent,
-                       std::shared_ptr<ChildWindow>* child_window, bool ontop) {
-  (*child_window)->set_on_top(ontop);
-
-  // Resize the child now.
-  RECT winRect;
-  GetClientRect(parent, &winRect);
-  (*child_window)
-      ->OnParentSize(0, 0, winRect.right - winRect.left,
-                     winRect.bottom - winRect.top);
 }
 
 //
