@@ -175,8 +175,8 @@ class ChildWindow : public WindowBase {
   void OnParentSize(size_t x, size_t y, size_t width, size_t height);
   void OnPaint();
   void SetClearColor(float r, float g, float b, float a);
-  void SetDrawColorGenerator(
-      std::function<void(float[4])>&& draw_color_generator);
+  void AddDrawColorGenerator(
+      std::function<void(float[4], D3D11_VIEWPORT&)>&& draw_color_generator);
 
  private:
   void InitializePaintContext();
@@ -184,7 +184,8 @@ class ChildWindow : public WindowBase {
   ComPtr<ID3D11Device> d3d11_device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<IDXGISwapChain1> swap_chain_;
-  std::function<void(float[4])> draw_color_generator_;
+  std::vector<std::function<void(float[4], D3D11_VIEWPORT&)>>
+      draw_color_generators_;
 
   float r_ = 0.0f;
   float g_ = 0.0f;
@@ -474,17 +475,6 @@ void ChildWindow::OnParentSize(size_t x, size_t y, size_t width,
 }
 
 void ChildWindow::OnPaint() {
-  RECT winRect;
-  GetClientRect(hwnd_parent_, &winRect);
-  D3D11_VIEWPORT viewport = {0.0f,
-                             0.0f,
-                             (FLOAT)(winRect.right - winRect.left),
-                             (FLOAT)(winRect.bottom - winRect.top),
-                             0.0f,
-                             1.0f};
-
-  context_->RSSetViewports(1, &viewport);
-
   // Create render target view
   ComPtr<ID3D11Texture2D> back_buffer;
   ComPtr<ID3D11RenderTargetView> render_target_view;
@@ -511,9 +501,13 @@ void ChildWindow::OnPaint() {
 
   // Clear center if on top
   MainWindow* main_window = WindowBase::FromHWND<MainWindow>(hwnd_parent_);
-  float color[4];
-  draw_color_generator_(color);
-  main_window->DrawHalfRect(color);
+  for (auto& generator : draw_color_generators_) {
+    float color[4];
+    D3D11_VIEWPORT viewport;
+    generator(color, viewport);
+    context_->RSSetViewports(1, &viewport);
+    main_window->DrawHalfRect(color);
+  }
 
   // Present back buffer in vsync
   swap_chain_->Present(0, 0);
@@ -576,9 +570,9 @@ void ChildWindow::SetClearColor(float r, float g, float b, float a) {
   a_ = a;
 }
 
-void ChildWindow::SetDrawColorGenerator(
-    std::function<void(float[4])>&& draw_color_generator) {
-  draw_color_generator_ = std::move(draw_color_generator);
+void ChildWindow::AddDrawColorGenerator(
+    std::function<void(float[4], D3D11_VIEWPORT&)>&& draw_color_generator) {
+  draw_color_generators_.emplace_back(std::move(draw_color_generator));
 }
 
 //
@@ -637,10 +631,25 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
           std::make_shared<ChildWindow>(hWnd));
   // set bottom child background to green.
   (*child_window)->SetClearColor(0.0f, 1.0f, 0.0f, 1.0f);
-  (*child_window)->SetDrawColorGenerator(std::move([](float outcolor[4]) {
-    float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    memcpy(outcolor, color, sizeof(float[4]));
-  }));
+  (*child_window)
+      ->AddDrawColorGenerator(
+          std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
+            // Generate random color values for red, green, and blue
+            float r = getRandomFloat();
+            float g = getRandomFloat();
+            float b = getRandomFloat();
+            OutputDebugStringFmt("rand color: %f, %f %f.", r, g, b);
+            float color[4] = {r, g, b, 1.0f};
+            memcpy(outcolor, color, sizeof(float[4]));
+            RECT winRect;
+            GetClientRect(hWnd, &winRect);
+            viewport = D3D11_VIEWPORT{0.0f,
+                                      0.0f,
+                                      (FLOAT)(winRect.right - winRect.left),
+                                      (FLOAT)(winRect.bottom - winRect.top),
+                                      0.0f,
+                                      1.0f};
+          }));
   main_window->AddChild(*child_window);
   InitInstanceChild(hInstance, hWnd, child_window.release(), false);
   if (true) {
@@ -648,15 +657,35 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
         std::make_shared<ChildWindow>(hWnd));
     // set top child background to red.
     (*child_window)->SetClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-    (*child_window)->SetDrawColorGenerator(std::move([](float outcolor[4]) {
-      // Generate random color values for red, green, and blue
-      float r = getRandomFloat();
-      float g = getRandomFloat();
-      float b = getRandomFloat();
-      OutputDebugStringFmt("rand color: %f, %f %f.", r, g, b);
-      float color[4] = {r, g, b, 1.0f};
-      memcpy(outcolor, color, sizeof(float[4]));
-    }));
+    (*child_window)
+        ->AddDrawColorGenerator(
+            std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
+              float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+              memcpy(outcolor, color, sizeof(float[4]));
+              RECT winRect;
+              GetClientRect(hWnd, &winRect);
+              viewport = D3D11_VIEWPORT{0.0f,
+                                        0.0f,
+                                        (FLOAT)(winRect.right - winRect.left),
+                                        (FLOAT)(winRect.bottom - winRect.top),
+                                        0.0f,
+                                        1.0f};
+            }));
+    (*child_window)
+        ->AddDrawColorGenerator(
+            std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
+              float color[4] = {1.0f, 1.0f, 1.0f, 0.1f};
+              memcpy(outcolor, color, sizeof(float[4]));
+              RECT winRect;
+              GetClientRect(hWnd, &winRect);
+              viewport = D3D11_VIEWPORT{
+                  static_cast<FLOAT>(winRect.right - winRect.left) / 4.0f,
+                  static_cast<FLOAT>(winRect.bottom - winRect.top) / 4.0f,
+                  static_cast<FLOAT>(winRect.right - winRect.left) / 2.0f,
+                  static_cast<FLOAT>(winRect.bottom - winRect.top) / 2.0f,
+                  0.0f,
+                  1.0f};
+            }));
     main_window->AddChild(*child_window);
     InitInstanceChild(hInstance, hWnd, child_window.release(), true);
   }
