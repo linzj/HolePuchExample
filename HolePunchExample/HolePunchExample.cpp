@@ -64,8 +64,8 @@ void OutputDebugStringFmt(const char* format, ...) {
 float getRandomFloat() {
   static std::random_device rd;   // Obtain a random number from hardware
   static std::mt19937 gen(rd());  // Seed the generator
-  static std::uniform_real_distribution<float> dis(0.0f,
-                                                   1.0f);  // Define the range
+  static std::uniform_real_distribution<float> dis(1.0f,
+                                                   16.0f);  // Define the range
   return dis(gen);
 }
 
@@ -563,7 +563,7 @@ void ContentLayer::InitializePaintContext() {
   scd.Scaling = DXGI_SCALING_STRETCH;
   scd.Width = width;
   scd.Height = height;
-  scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  scd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
   scd.Stereo = FALSE;
   scd.BufferUsage = DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_RENDER_TARGET_OUTPUT;
   scd.Flags = 0;
