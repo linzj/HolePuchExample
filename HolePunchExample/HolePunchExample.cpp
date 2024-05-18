@@ -674,7 +674,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     (*child_window)
         ->AddDrawColorGenerator(
             std::move([hWnd](float outcolor[4], D3D11_VIEWPORT& viewport) {
-              float color[4] = {1.0f, 1.0f, 1.0f, 0.1f};
+              float color[4] = {0.1f, 0.1f, 0.1f, 0.0f};
               memcpy(outcolor, color, sizeof(float[4]));
               RECT winRect;
               GetClientRect(hWnd, &winRect);
